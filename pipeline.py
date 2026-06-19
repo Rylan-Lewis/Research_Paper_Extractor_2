@@ -33,13 +33,37 @@ OPENALEX_WORKS = "https://api.openalex.org/works"
 OPENALEX_PER_PAGE = 200
 OPENALEX_RATE_SLEEP = 0.5
 
-ALLOWED_JOURNALS = {
+# ALLOWED_JOURNALS = {
+#     "Management Science",
+#     "Administrative Science Quarterly",
+#     "Academy of Management Journal",
+#     "Strategic Management Journal",
+#     "Organization Science"
+# }
+
+# ISSN_MAP = {
+#     "Management Science": "0025-1909",
+#     "Administrative Science Quarterly": "0001-8392",
+#     "Academy of Management Journal": "0001-4273",
+#     "Strategic Management Journal": "0143-2095",
+#     "Organization Science": "1047-7039",
+# }
+
+MAIN_JOURNALS = {
     "Management Science",
     "Administrative Science Quarterly",
     "Academy of Management Journal",
     "Strategic Management Journal",
-    "Organization Science"
+    "Organization Science",
 }
+
+SECONDARY_JOURNALS = {
+    "Strategic Entrepreneurship Journal",
+    "Journal of Business Venturing",
+    "Research Policy",
+}
+
+ALLOWED_JOURNALS = MAIN_JOURNALS | SECONDARY_JOURNALS
 
 ISSN_MAP = {
     "Management Science": "0025-1909",
@@ -47,6 +71,9 @@ ISSN_MAP = {
     "Academy of Management Journal": "0001-4273",
     "Strategic Management Journal": "0143-2095",
     "Organization Science": "1047-7039",
+    "Strategic Entrepreneurship Journal": "1932-4391",
+    "Journal of Business Venturing": "0883-9026",
+    "Research Policy": "0048-7333",
 }
 
 YEARS_BACK = 5
@@ -146,26 +173,6 @@ def fetch_openalex_for_journal(journal_name: str, years_back: int = YEARS_BACK, 
         time.sleep(OPENALEX_RATE_SLEEP)
     print(f"[OpenAlex] {journal_name}: fetched {len(all_papers)} papers (pages={page_count})")
     return all_papers
-
-def fetch_openalex_for_journals(years_back: int = YEARS_BACK) -> List[Dict[str, Any]]:
-    overall = {}
-    print(f"Fetching papers for journals (last {years_back} years) via OpenAlex across {len(ALLOWED_JOURNALS)} journals...")
-    for journal in ALLOWED_JOURNALS:
-        print(f" -> querying journal (OpenAlex): {journal}")
-        try:
-            papers = fetch_openalex_for_journal(journal, years_back=years_back, per_page=OPENALEX_PER_PAGE)
-        except Exception as e:
-            print(f"[OpenAlex] error fetching {journal}: {e}")
-            papers = []
-        for p in papers:
-            pid = p.get("paperId") or (p.get("title") or "").strip().lower()
-            if not pid:
-                continue
-            if pid not in overall:
-                overall[pid] = p
-    collected = list(overall.values())
-    print(f"Fetched {len(collected)} unique papers across journals via OpenAlex.")
-    return collected
 
 # 3) Processing helpers (keywords, summarization, paper type)
 def extract_keywords(paper, top_k=5):
@@ -323,13 +330,33 @@ def infer_paper_type(title, abstract):
     return type_map.get(classification, "unclear")
 
 # 4) Top-level API: fetch_openalex_for_journals and process_paper_by_meta
-def fetch_openalex_for_journals(years_back: int = YEARS_BACK) -> List[Dict[str, Any]]:
-    return fetch_openalex_for_journals_impl(years_back=years_back)
+# def fetch_openalex_for_journals(years_back: int = YEARS_BACK) -> List[Dict[str, Any]]:
+#     return fetch_openalex_for_journals_impl(years_back=years_back)
+
+# def fetch_openalex_for_journals_impl(years_back: int = YEARS_BACK) -> List[Dict[str, Any]]:
+#     overall = {}
+#     print(f"Fetching papers for journals (last {years_back} years) via OpenAlex across {len(ALLOWED_JOURNALS)} journals...")
+#     for journal in ALLOWED_JOURNALS:
+#         try:
+#             papers = fetch_openalex_for_journal(journal, years_back=years_back, per_page=OPENALEX_PER_PAGE)
+#         except Exception as e:
+#             print(f"[OpenAlex] error fetching {journal}: {e}")
+#             papers = []
+#         for p in papers:
+#             pid = p.get("paperId") or (p.get("title") or "").strip().lower()
+#             if not pid:
+#                 continue
+#             if pid not in overall:
+#                 overall[pid] = p
+#     collected = list(overall.values())
+#     print(f"Fetched {len(collected)} unique papers across journals via OpenAlex.")
+#     return collected
 
 def fetch_openalex_for_journals_impl(years_back: int = YEARS_BACK) -> List[Dict[str, Any]]:
     overall = {}
     print(f"Fetching papers for journals (last {years_back} years) via OpenAlex across {len(ALLOWED_JOURNALS)} journals...")
     for journal in ALLOWED_JOURNALS:
+        group = "Main" if journal in MAIN_JOURNALS else "Secondary"
         try:
             papers = fetch_openalex_for_journal(journal, years_back=years_back, per_page=OPENALEX_PER_PAGE)
         except Exception as e:
@@ -339,6 +366,7 @@ def fetch_openalex_for_journals_impl(years_back: int = YEARS_BACK) -> List[Dict[
             pid = p.get("paperId") or (p.get("title") or "").strip().lower()
             if not pid:
                 continue
+            p["journal_group"] = group          # <-- new
             if pid not in overall:
                 overall[pid] = p
     collected = list(overall.values())
@@ -409,11 +437,9 @@ def process_paper_by_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
     # link
     out["link"] = meta.get("doi") or meta.get("url") or meta.get("openalex_url") or meta.get("paperId") or ""
 
+    out["journal_group"] = meta.get("journal_group", "Main")
     return out
 
-# Export the two main functions with stable names:
-def fetch_openalex_for_journals_wrapper():
-    return fetch_openalex_for_journals_impl()
 
 # alias for the incremental driver
 fetch_openalex_for_journals = fetch_openalex_for_journals_impl
