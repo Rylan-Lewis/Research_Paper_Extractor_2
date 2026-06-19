@@ -35,6 +35,18 @@ FIELDNAMES = [
     "abstract_full", "keywords", "abstract_summary", "paper_type", "link"
 ]
 
+TAB_NAMES = ["Main", "Secondary", "Entrepreneurship / startup", "Career / labor market"]
+KEYWORD_TAB_RULES = {
+    "Entrepreneurship / startup": ["entrepreneurship", "startup"],
+    "Career / labor market": ["career", "labor market"],
+}
+
+def matches_keyword_group(keywords_str: str, terms: List[str]) -> bool:
+    if not keywords_str:
+        return False
+    text = keywords_str.lower()
+    return any(t.lower() in text for t in terms)
+
 # Safety and tuning parameters
 DEFAULT_APPEND_BATCH_SIZE = 50     # soft cap for rows per append call (starting point)
 APPEND_RETRIES = 5
@@ -81,6 +93,11 @@ def open_worksheet(client, sheet_id: str, worksheet_name=None):
     else:
         ws = sh.get_worksheet(0)
     return ws
+
+def open_all_worksheets(client, sheet_id: str):
+    sh = client.open_by_key(sheet_id)
+    return {name: sh.worksheet(name) for name in TAB_NAMES}
+
 
 def read_existing_ids_from_sheet(ws, id_header=ID_HEADER) -> set:
     # Try to read header row to find ID column; otherwise assume column A
@@ -179,14 +196,15 @@ def incremental_run_sheet_only():
     if not sheet_id:
         raise ValueError("SHEET_ID environment variable not set.")
     client = gs_client_from_env()
-    ws = open_worksheet(client, sheet_id, WORKSHEET_NAME)
-    print("Opened worksheet:", ws.title)
+    worksheets = open_all_worksheets(client, sheet_id)
+    print("Opened tabs:", list(worksheets.keys()))
 
-    # 1) read existing ids
-    existing_ids = read_existing_ids_from_sheet(ws)
-    print(f"Existing IDs in sheet: {len(existing_ids)}")
+    # 1) read existing ids, per tab
+    existing_ids = {name: read_existing_ids_from_sheet(ws) for name, ws in worksheets.items()}
+    for name, ids in existing_ids.items():
+        print(f"Existing IDs in '{name}': {len(ids)}")
 
-    # 2) fetch remote papers via pipeline fetcher
+    # 2) fetch remote papers via pipeline fetcher (covers Main + Secondary journals)
     fetched = fetch_openalex_for_journals()
     print(f"Fetched {len(fetched)} records from remote source.")
 
@@ -201,18 +219,19 @@ def incremental_run_sheet_only():
 
     print(f"Normalized fetched ids: {len(fetched_by_id)}")
 
-    # 4) compute new ids
-    new_ids = [pid for pid in fetched_by_id.keys() if pid not in existing_ids]
+    # 4) gate processing on the paper's primary tab (Main or Secondary)
+    new_ids = [
+        pid for pid, meta in fetched_by_id.items()
+        if pid not in existing_ids[meta.get("journal_group", "Main")]
+    ]
     print(f"New papers to process: {len(new_ids)}")
     if not new_ids:
         print("No new items found. Exiting.")
         return
 
-    # 5) process new items and append in safe chunks
+    # 5) process new items and route into per-tab batches
     processed = 0
-    batch_rows = []
-    sample_row_sizes = []
-    dynamic_max_rows = DEFAULT_APPEND_BATCH_SIZE
+    batch_rows = {name: [] for name in TAB_NAMES}
 
     for pid in tqdm(new_ids, desc="Processing new papers"):
         meta = fetched_by_id[pid]
@@ -227,36 +246,35 @@ def incremental_run_sheet_only():
 
         # create ordered row
         row = [str(out.get(col, "")) for col in FIELDNAMES]
-        batch_rows.append(row)
+
+        # primary tab: Main or Secondary, based on which journal it came from
+        primary_tab = meta.get("journal_group", "Main")
+        batch_rows[primary_tab].append(row)
+
+        # keyword tabs: additive, not exclusive — a paper can also land here
+        kw_str = out.get("keywords", "")
+        for tab_name, terms in KEYWORD_TAB_RULES.items():
+            if matches_keyword_group(kw_str, terms) and pid not in existing_ids[tab_name]:
+                batch_rows[tab_name].append(row)
+
         processed += 1
 
-        # collect sample sizes for dynamic tuning
-        if len(sample_row_sizes) < DYNAMIC_SAMPLE_SIZE:
-            sample_row_sizes.append(estimate_row_bytes(row))
-            if len(sample_row_sizes) == DYNAMIC_SAMPLE_SIZE:
-                avg_row_bytes = max(1, sum(sample_row_sizes) / len(sample_row_sizes))
-                # compute rows that would fit under MAX_PAYLOAD_BYTES
-                rows_by_size = max(1, int(MAX_PAYLOAD_BYTES // avg_row_bytes))
-                # cap rows to DEFAULT_APPEND_BATCH_SIZE to avoid too-large call counts
-                dynamic_max_rows = min(DEFAULT_APPEND_BATCH_SIZE, rows_by_size)
-                print(f"[tune] avg_row_bytes={avg_row_bytes:.1f}, dynamic_max_rows={dynamic_max_rows}")
+        # flush any tab that's hit the batch cap
+        for name in TAB_NAMES:
+            if len(batch_rows[name]) >= DEFAULT_APPEND_BATCH_SIZE:
+                for chunk in chunk_rows_for_append(batch_rows[name], max_rows=DEFAULT_APPEND_BATCH_SIZE, max_bytes=MAX_PAYLOAD_BYTES):
+                    append_rows_with_retries(worksheets[name], chunk)
+                    print(f"[append] appended {len(chunk)} rows to '{name}'")
+                batch_rows[name] = []
 
-        # flush when we reach the dynamic capacity (or hard cap if tuning not ready)
-        effective_cap = dynamic_max_rows if len(sample_row_sizes) >= DYNAMIC_SAMPLE_SIZE else DEFAULT_APPEND_BATCH_SIZE
-        if len(batch_rows) >= effective_cap:
-            # chunk defensively (this will respect bytes and max_rows)
-            for chunk in chunk_rows_for_append(batch_rows, max_rows=effective_cap, max_bytes=MAX_PAYLOAD_BYTES):
-                append_rows_with_retries(ws, chunk)
-                print(f"[append] appended {len(chunk)} rows")
-            batch_rows = []
+    # 6) final flush, per tab
+    for name in TAB_NAMES:
+        if batch_rows[name]:
+            for chunk in chunk_rows_for_append(batch_rows[name], max_rows=DEFAULT_APPEND_BATCH_SIZE, max_bytes=MAX_PAYLOAD_BYTES):
+                append_rows_with_retries(worksheets[name], chunk)
+                print(f"[append] appended {len(chunk)} rows to '{name}' (final)")
 
-    # final flush
-    if batch_rows:
-        for chunk in chunk_rows_for_append(batch_rows, max_rows=dynamic_max_rows, max_bytes=MAX_PAYLOAD_BYTES):
-            append_rows_with_retries(ws, chunk)
-            print(f"[append] appended {len(chunk)} rows (final)")
-
-    print(f"Done. Processed and appended {processed} new papers.")
+    print(f"Done. Processed {processed} new papers.")
 
 if __name__ == "__main__":
     start = time.time()
