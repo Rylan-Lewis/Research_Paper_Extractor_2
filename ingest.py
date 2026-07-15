@@ -1,15 +1,3 @@
-# incremental.py
-"""
-Sheet-only incremental ingestion driver (patched for Sheets quotas + dynamic tuning).
-
-Usage:
-  - Ensure my_pipeline.py implements:
-      fetch_openalex_for_journals() -> List[dict]
-      process_paper_by_meta(meta) -> dict (must include keys used in FIELDNAMES)
-  - Set env vars SHEET_ID and GCP_SA_JSON (the service account JSON contents).
-  - Run: python incremental.py
-"""
-
 import os
 import json
 import time
@@ -19,17 +7,14 @@ from tqdm import tqdm
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-
-# import pipeline functions (from your pipeline implementation)
 from pipeline import fetch_openalex_for_journals, process_paper_by_meta
 
 # ---------------- CONFIG ----------------
 SHEET_ID_ENV = "SHEET_ID"
 GCP_SA_JSON_ENV = "GCP_SA_JSON"
-WORKSHEET_NAME = None   # None -> first worksheet/tab
-ID_HEADER = "paper_id"  # header name of the ID column in the sheet
+WORKSHEET_NAME = None  
+ID_HEADER = "paper_id" 
 
-# Default output columns (must match keys returned by process_paper_by_meta)
 FIELDNAMES = [
     "paper_id", "title", "authors", "year", "venue",
     "abstract_full", "keywords", "abstract_summary", "paper_type", "link"
@@ -41,6 +26,19 @@ KEYWORD_TAB_RULES = {
     "Career / labor market": ["career", "labor market"],
 }
 
+append_ORDER = ["Entrepreneurship / startup", "Career / labor market", "Main", "Secondary"]
+PAPERS_PER_append = 50
+
+def append_all_batches(worksheets, batch_rows):
+    for name in append_ORDER:
+        rows = batch_rows.get(name)
+        if not rows:
+            continue
+        for chunk in chunk_rows_for_append(rows, max_rows=DEFAULT_APPEND_BATCH_SIZE, max_bytes=MAX_PAYLOAD_BYTES):
+            append_rows_with_retries(worksheets[name], chunk)
+            print(f"[append] appended {len(chunk)} rows to '{name}'")
+        batch_rows[name] = []
+
 def matches_keyword_group(keywords_str: str, terms: List[str]) -> bool:
     if not keywords_str:
         return False
@@ -48,22 +46,20 @@ def matches_keyword_group(keywords_str: str, terms: List[str]) -> bool:
     return any(t.lower() in text for t in terms)
 
 # Safety and tuning parameters
-DEFAULT_APPEND_BATCH_SIZE = 50     # soft cap for rows per append call (starting point)
+DEFAULT_APPEND_BATCH_SIZE = 50 
 APPEND_RETRIES = 5
 INITIAL_BACKOFF = 1.0
 MAX_BACKOFF = 30.0
 
-# Sheets quota safety
-# Google Sheets per-minute per-user write quota ~60. Leave margin.
+# Google Sheets per-minute per-user write quota
 APPEND_CALLS_PER_MINUTE = 50
 
-# Max recommended payload (2MB doc); keep margin.
+# Max recommended payload (2MB doc)
 MAX_PAYLOAD_BYTES = 1_800_000
 
 # Dynamic tuning sample size: how many processed rows to sample to estimate avg row size.
 DYNAMIC_SAMPLE_SIZE = 8
 
-# ---------------- Helpers ----------------
 _last_append_time = 0.0
 
 def normalize_openalex_id(raw_id: str) -> str | None:
@@ -100,7 +96,6 @@ def open_all_worksheets(client, sheet_id: str):
 
 
 def read_existing_ids_from_sheet(ws, id_header=ID_HEADER) -> set:
-    # Try to read header row to find ID column; otherwise assume column A
     try:
         header = ws.row_values(1)
     except Exception:
@@ -133,9 +128,6 @@ def estimate_rows_bytes(rows: List[List[str]]) -> int:
     return sum(estimate_row_bytes(r) for r in rows)
 
 def chunk_rows_for_append(rows: List[List[str]], max_rows=DEFAULT_APPEND_BATCH_SIZE, max_bytes=MAX_PAYLOAD_BYTES):
-    """
-    Yield chunks that respect both max_rows and max_bytes.
-    """
     buf = []
     buf_bytes = 0
     for row in rows:
@@ -154,10 +146,8 @@ def chunk_rows_for_append(rows: List[List[str]], max_rows=DEFAULT_APPEND_BATCH_S
     if buf:
         yield buf
 
+#Ensure at least min_interval_seconds has passed since last append.
 def _ensure_rate_limit(min_interval_seconds: float):
-    """
-    Ensure at least min_interval_seconds has passed since last append.
-    """
     global _last_append_time
     now = time.time()
     elapsed = now - _last_append_time
@@ -168,10 +158,8 @@ def _ensure_rate_limit(min_interval_seconds: float):
         print(f"[throttle] sleeping {sleep_time:.2f}s to respect per-minute quota")
         time.sleep(sleep_time)
 
+# Append rows with exponential backoff and quota-aware pacing.
 def append_rows_with_retries(ws, rows: List[List[str]], retries=APPEND_RETRIES):
-    """
-    Append rows with exponential backoff and quota-aware pacing.
-    """
     global _last_append_time
     min_interval = 60.0 / float(APPEND_CALLS_PER_MINUTE)
     attempt = 0
@@ -190,7 +178,7 @@ def append_rows_with_retries(ws, rows: List[List[str]], retries=APPEND_RETRIES):
             print(f"[WARN] append_rows error (attempt {attempt}/{retries}): {e}. Backing off {backoff:.1f}s")
             time.sleep(backoff)
 
-# ---------------- Main incremental flow ----------------
+# Main incremental flow
 def incremental_run_sheet_only():
     sheet_id = os.environ.get(SHEET_ID_ENV)
     if not sheet_id:
@@ -232,14 +220,25 @@ def incremental_run_sheet_only():
     # 5) process new items and route into per-tab batches
     processed = 0
     batch_rows = {name: [] for name in TAB_NAMES}
+    since_last_append = 0
+    loop_start = time.time()
 
-    for pid in tqdm(new_ids, desc="Processing new papers"):
+    for i, pid in enumerate(tqdm(new_ids, desc="Processing new papers"), start=1):
         meta = fetched_by_id[pid]
         try:
+            paper_start = time.time()
             out = process_paper_by_meta(meta)
+            paper_elapsed = time.time() - paper_start
         except Exception as e:
             print(f"[WARN] Error processing {pid}: {e}")
             continue
+
+        # timing readout: every 10 papers, print avg + projected total
+        if i % 10 == 0:
+            avg = (time.time() - loop_start) / i
+            remaining = (len(new_ids) - i) * avg
+            print(f"[timing] {i}/{len(new_ids)} | last paper {paper_elapsed:.1f}s | "
+                  f"avg {avg:.1f}s/paper | est. {remaining/3600:.1f}h remaining")
 
         # ensure normalized paper_id is used
         out["paper_id"] = pid
@@ -258,21 +257,15 @@ def incremental_run_sheet_only():
                 batch_rows[tab_name].append(row)
 
         processed += 1
+        since_last_append += 1
 
-        # flush any tab that's hit the batch cap
-        for name in TAB_NAMES:
-            if len(batch_rows[name]) >= DEFAULT_APPEND_BATCH_SIZE:
-                for chunk in chunk_rows_for_append(batch_rows[name], max_rows=DEFAULT_APPEND_BATCH_SIZE, max_bytes=MAX_PAYLOAD_BYTES):
-                    append_rows_with_retries(worksheets[name], chunk)
-                    print(f"[append] appended {len(chunk)} rows to '{name}'")
-                batch_rows[name] = []
+        # Append all tabs together, keyword tabs first, every PAPERS_PER_append papers
+        if since_last_append >= PAPERS_PER_append:
+            append_all_batches(worksheets, batch_rows)
+            since_last_append = 0
 
-    # 6) final flush, per tab
-    for name in TAB_NAMES:
-        if batch_rows[name]:
-            for chunk in chunk_rows_for_append(batch_rows[name], max_rows=DEFAULT_APPEND_BATCH_SIZE, max_bytes=MAX_PAYLOAD_BYTES):
-                append_rows_with_retries(worksheets[name], chunk)
-                print(f"[append] appended {len(chunk)} rows to '{name}' (final)")
+    # 6) final append same grouped order
+    append_all_batches(worksheets, batch_rows)
 
     print(f"Done. Processed {processed} new papers.")
 
